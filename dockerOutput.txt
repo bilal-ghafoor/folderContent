@@ -1,0 +1,1938 @@
+docker/
+├── Dockerfile
+    Content:
+    # Use an official Python runtime as the base image
+FROM python:3.12-slim
+
+# Set the working directory in the container
+WORKDIR /SolanaDiscord
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    unzip \
+    libglib2.0-0 \
+    libnss3 \
+    libgconf-2-4 \
+    libfontconfig1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Chrome
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install ChromeDriver
+RUN CHROME_DRIVER_VERSION=`curl -sS chromedriver.storage.googleapis.com/LATEST_RELEASE` && \
+    wget -N http://chromedriver.storage.googleapis.com/$CHROME_DRIVER_VERSION/chromedriver_linux64.zip -P ~/ && \
+    unzip ~/chromedriver_linux64.zip -d ~/ && \
+    rm ~/chromedriver_linux64.zip && \
+    mv -f ~/chromedriver /usr/local/bin/chromedriver && \
+    chown root:root /usr/local/bin/chromedriver && \
+    chmod 0755 /usr/local/bin/chromedriver
+
+# Copy the requirements file into the container
+COPY requirements.txt .
+
+# Install the Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the project files into the container
+COPY . .
+
+# Run the application
+CMD ["python", "SolanaDiscord/app.py"]
+
+    --------------------------------------------------
+├── assets/
+│   ├── gui/
+│   │   └── sniper_gui.py
+│   │       Content:
+│   │       import tkinter as tk
+from tkinter import ttk, scrolledtext
+import threading
+import queue
+import psutil
+import os
+import signal
+import os 
+
+class GradientFrame(tk.Canvas):
+    def __init__(self, parent, color1="#1e1e1e", color2="#2a2a2a", **kwargs):
+        tk.Canvas.__init__(self, parent, **kwargs)
+        self._color1 = color1
+        self._color2 = color2
+        self.bind("<Configure>", self._draw_gradient)
+
+    def _draw_gradient(self, event=None):
+        self.delete("gradient")
+        width = self.winfo_width()
+        height = self.winfo_height()
+        (r1,g1,b1) = self.winfo_rgb(self._color1)
+        (r2,g2,b2) = self.winfo_rgb(self._color2)
+        r_ratio = float(r2-r1) / height
+        g_ratio = float(g2-g1) / height
+        b_ratio = float(b2-b1) / height
+
+        for i in range(height):
+            nr = int(r1 + (r_ratio * i))
+            ng = int(g1 + (g_ratio * i))
+            nb = int(b1 + (b_ratio * i))
+            color = "#%4.4x%4.4x%4.4x" % (nr,ng,nb)
+            self.create_line(0, i, width, i, tags=("gradient",), fill=color)
+        self.lower("gradient")
+
+class SniperApp:
+    def __init__(self, master, start_sniper_func, stop_sniper_func, message_queue):
+        self.master = master
+        master.title("Sniper Bot")
+        master.geometry("400x300")
+        master.configure(bg='#1e1e1e')
+
+        self.start_sniper_func = start_sniper_func
+        self.stop_sniper_func = stop_sniper_func
+        self.message_queue = message_queue
+
+        self.is_running = False
+        self.create_widgets()
+        self.check_queue()
+
+        self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def create_widgets(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('TFrame', background='#1e1e1e')
+        style.configure('TButton', font=('Arial', 12), background='#2a2a2a', foreground='#00ff00')
+        style.configure('TLabel', font=('Arial', 12), background='#1e1e1e', foreground='#00ff00')
+        style.configure('TEntry', fieldbackground='#2a2a2a', foreground='#00ff00')
+
+        main_frame = ttk.Frame(self.master, padding="20")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.master.grid_columnconfigure(0, weight=1)
+        self.master.grid_rowconfigure(0, weight=1)
+
+        # Status indicator
+        self.status_frame = ttk.Frame(main_frame)
+        self.status_frame.grid(row=0, column=0, columnspan=2, pady=(0, 20), sticky='e')
+        self.status_indicator = tk.Canvas(self.status_frame, width=20, height=20, bg='#1e1e1e', highlightthickness=0)
+        self.status_indicator.grid(row=0, column=0, padx=(0, 10))
+        self.status_label = ttk.Label(self.status_frame, text="Stopped")
+        self.status_label.grid(row=0, column=1)
+
+        # Control buttons
+        self.start_button = ttk.Button(main_frame, text="Start Sniper", command=self.start_sniper)
+        self.start_button.grid(row=1, column=0, pady=10, padx=5, sticky='ew')
+        self.stop_button = ttk.Button(main_frame, text="Stop Sniper", command=self.stop_sniper, state=tk.DISABLED)
+        self.stop_button.grid(row=1, column=1, pady=10, padx=5, sticky='ew')
+
+        # Latest CA display
+        ttk.Label(main_frame, text="Latest CA:").grid(row=2, column=0, sticky=tk.W, pady=10)
+        self.latest_ca_var = tk.StringVar()
+        ttk.Entry(main_frame, textvariable=self.latest_ca_var, state="readonly", width=30).grid(row=2, column=1, sticky=tk.W, pady=10)
+
+        # Log toggle button
+        self.show_logs = False
+        self.log_button = ttk.Button(main_frame, text="Show Logs", command=self.toggle_logs)
+        self.log_button.grid(row=3, column=0, columnspan=2, pady=10, sticky='ew')
+
+        # Hidden log area
+        self.log_area = scrolledtext.ScrolledText(main_frame, wrap=tk.WORD, width=50, height=10, bg='#2a2a2a', fg='#00ff00')
+        self.log_area.grid(row=4, column=0, columnspan=2, pady=10, sticky='nsew')
+        self.log_area.grid_remove()
+
+        main_frame.grid_columnconfigure(0, weight=1)
+        main_frame.grid_columnconfigure(1, weight=1)
+        main_frame.grid_rowconfigure(4, weight=1)
+
+        image_path = os.path.join(os.path.dirname(__file__), "sniperlogo.png")
+        self.master.iconphoto(False, tk.PhotoImage(file=image_path))
+
+        self.update_status()
+
+    def start_sniper(self):
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.is_running = True
+        self.update_status()
+        self.start_sniper_func()
+
+    def stop_sniper(self):
+        self.stop_button.config(state=tk.DISABLED)
+        self.start_button.config(state=tk.NORMAL)
+        self.is_running = False
+        self.update_status()
+        self.stop_sniper_func()
+
+    def update_status(self):
+        if self.is_running:
+            self.status_indicator.delete("all")
+            self.status_indicator.create_oval(2, 2, 18, 18, fill='#00ff00', outline='#00ff00')
+            self.status_label.config(text="Running")
+        else:
+            self.status_indicator.delete("all")
+            self.status_indicator.create_oval(2, 2, 18, 18, fill='red', outline='red')
+            self.status_label.config(text="Stopped")
+
+    def toggle_logs(self):
+        if self.show_logs:
+            self.log_area.grid_remove()
+            self.log_button.config(text="Show Logs")
+            self.master.geometry("400x300")
+        else:
+            self.log_area.grid()
+            self.log_button.config(text="Hide Logs")
+            self.master.geometry("400x500")
+        self.show_logs = not self.show_logs
+
+    def on_closing(self):
+        self.log("Closing application and cleaning up Chrome processes...")
+        self.stop_sniper()
+        self.cleanup_chrome_processes()
+        self.master.destroy()
+
+    def cleanup_chrome_processes(self):
+        for proc in psutil.process_iter(['pid', 'name', 'exe']):
+            try:
+                if 'chrome' in proc.info['name'].lower():
+                    exe_path = proc.info['exe']
+                    if 'Temp' in exe_path:
+                        self.log(f"Terminating Chrome process: {proc.info['pid']}")
+                        if os.name == 'nt':  # Windows
+                            proc.terminate()
+                        else:  # Unix-based systems
+                            os.kill(proc.info['pid'], signal.SIGTERM)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+
+        gone, alive = psutil.wait_procs(psutil.process_iter(), timeout=3)
+        
+        for p in alive:
+            if 'chrome' in p.name().lower():
+                self.log(f"Force killing Chrome process: {p.pid}")
+                if os.name == 'nt':  # Windows
+                    p.kill()
+                else:  # Unix-based systems
+                    os.kill(p.pid, signal.SIGKILL)
+
+    def log(self, message):
+        self.log_area.insert(tk.END, message + "\n")
+        self.log_area.see(tk.END)
+
+    def check_queue(self):
+        try:
+            while True:
+                message = self.message_queue.get_nowait()
+                if isinstance(message, dict):
+                    if 'ca' in message:
+                        self.latest_ca_var.set(message['ca'])
+                    if 'log' in message:
+                        self.log(message['log'])
+                else:
+                    self.log(str(message))
+        except queue.Empty:
+            pass
+        self.master.after(100, self.check_queue)
+│   │       --------------------------------------------------
+│   └── sniperlogo.png
+│       Content:
+│       Error reading file: 'utf-8' codec can't decode byte 0x89 in position 0: invalid start byte
+│       --------------------------------------------------
+├── docker-compose.yml
+    Content:
+    version: '3.8'
+
+services:
+  sniper_bot:
+    build: .
+    volumes:
+      - ./app:/SolanaDiscord/app
+      - ./logs:/SolanaDiscord/logs
+      - ./screenshots:/SolanaDiscord/screenshots
+      - ./bot_screenshots:/SolanaDiscord/bot_screenshots
+      - ./.env:/SolanaDiscord/.env
+    environment:
+      - DISPLAY=:0
+    depends_on:
+      - selenium
+    networks:
+      - sniper_net
+
+  selenium:
+    image: selenium/standalone-chrome:latest
+    ports:
+      - "4444:4444"
+    volumes:
+      - /dev/shm:/dev/shm
+    networks:
+      - sniper_net
+
+networks:
+  sniper_net:
+    driver: bridge
+
+    --------------------------------------------------
+├── requirements.txt
+    Content:
+    
+    --------------------------------------------------
+├── runscripts.sh
+    Content:
+    
+    --------------------------------------------------
+└── scripts/
+    ├── original_script.py
+        Content:
+        import os
+import time
+import csv
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
+import re
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
+import queue
+from twilio.rest import Client
+import traceback
+import threading
+import psutil
+from PIL import Image
+import io
+import tkinter as tk
+from sniper_gui import SniperApp
+from telethon import TelegramClient
+from telethon.tl.types import InputPeerUser
+from telethon.tl.functions.contacts import ResolveUsernameRequest
+import asyncio
+
+# Load environment variables
+load_dotenv()
+
+# Load environment variables
+# Get the API ID, API Hash, and phone number from environment variables
+# Global variables
+NEW_WIF_CHANNEL = os.getenv('NEW_WIF_CHANNEL')
+
+API_ID = os.getenv('TELEGRAM_API_ID')
+API_HASH = os.getenv('TELEGRAM_API_HASH')
+PHONE_NUMBER = os.getenv('TELEGRAM_PHONE_NUMBER')
+CONTACT_USERNAME = os.getenv('TELEGRAM_CONTACT_USERNAME')
+
+sniper_running = False
+last_trade_time = 0
+first_token_ignored = False
+trading_driver = None
+# Create a Telegram client
+telegram_client = TelegramClient('session', API_ID, API_HASH)
+
+
+
+
+# Base user data directory for Chrome profiles
+base_user_data_dir = os.path.join(os.getcwd(), 'chrome_profiles')
+os.makedirs(base_user_data_dir, exist_ok=True)
+
+async def send_telegram_message(message_content):
+    try:
+        await telegram_client.start(phone=PHONE_NUMBER)
+
+        # Resolve the username to get the user's ID
+        contact = await telegram_client(ResolveUsernameRequest(CONTACT_USERNAME))
+        user_id = contact.peer.user_id
+
+        # Get the InputPeerUser object
+        contact = InputPeerUser(user_id, contact.users[0].access_hash)
+
+        # Send the message
+        await telegram_client.send_message(contact, message_content)
+        print("Telegram message sent successfully!")
+        
+        await telegram_client.disconnect()
+        return True
+    except Exception as e:
+        print(f"Error sending Telegram message: {str(e)}")
+        return False
+
+# Function to run the async function
+def send_message_to_contact(message_content):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(send_telegram_message(message_content))
+    finally:
+        loop.close()
+
+def log_trade(trade_data, log_file='trade_logs.csv'):
+    fieldnames = ['timestamp', 'action', 'contract_address', 'amount', 'slippage', 'priority_fee', 'signature', 'status', 'error']
+    file_exists = os.path.isfile(log_file)
+
+    with open(log_file, 'a', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(trade_data)
+
+def force_quit_chromedriver():
+    for proc in psutil.process_iter(['pid', 'name']):
+        if 'chromedriver' in proc.info['name'].lower():
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                proc.kill()
+
+def open_trading_browser():
+    global trading_driver
+    service = ChromeService(ChromeDriverManager().install())
+    chrome_options = Options()
+
+    # Use a persistent profile directory
+    trading_profile_dir = os.path.join(base_user_data_dir, 'trading_profile')
+    os.makedirs(trading_profile_dir, exist_ok=True)
+    chrome_options.add_argument(f"user-data-dir={trading_profile_dir}")
+    
+    # Add necessary arguments
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--start-maximized")
+    #chrome_options.add_argument("--headless=new")
+
+    trading_driver = webdriver.Chrome(service=service, options=chrome_options)
+    trading_driver.get("https://bullx.io/")  # Load the initial page
+
+def execute_trade(contract_address, action, amount, slippage, priority_fee, message_queue, extraction_time):
+    global trading_driver
+    trade_start_time = time.time()
+    trade_data = {
+        'timestamp': datetime.now().isoformat(),
+        'action': action,
+        'contract_address': contract_address,
+        'amount': amount,
+        'slippage': slippage,
+        'priority_fee': priority_fee,
+        'signature': None,
+        'status': 'Initiated',
+        'error': None
+    }
+
+    try:
+        print(f"Attempting to execute trade for {contract_address}")
+        message_queue.put({'log': f"Attempting to execute trade for {contract_address}"})
+        
+        trading_url = f'https://bullx.io/terminal?chainId=1399811149&address={contract_address}'
+        trading_driver.get(trading_url)
+
+        WebDriverWait(trading_driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        
+        print(f"Loaded trading page: {trading_url}")
+        message_queue.put({'log': f"Loaded trading page: {trading_url}"})
+
+        time.sleep(0.3)
+
+        max_attempts = 100
+        attempt = 0
+        buy_button_clicked = False
+
+        while attempt < max_attempts and not buy_button_clicked:
+            attempt += 1
+            print(f"Attempt {attempt} to click buttons")
+            message_queue.put({'log': f"Attempt {attempt} to click buttons"})
+
+            preset_button_xpath = f"//button[contains(@class, 'ant-btn-default') and contains(@class, 'flex-1') and .//span[text()='{amount}']]"
+            if click_button_with_retry(preset_button_xpath):
+                print(f"Clicked preset button: {amount}")
+                message_queue.put({'log': f"Clicked preset button: {amount}"})
+                time.sleep(0.3)
+            else:
+                print(f"Failed to click preset button: {amount}")
+                message_queue.put({'log': f"Failed to click preset button: {amount}"})
+
+            buy_button_xpath = "//button[contains(@class, 'ant-btn-primary') and contains(., 'Buy')]"
+            if click_button_with_retry(buy_button_xpath):
+                button_click_time = time.time()
+                print("Clicked Buy button")
+                message_queue.put({'log': "Clicked Buy button"})
+                buy_button_clicked = True
+                break
+            else:
+                print("Failed to click Buy button")
+                message_queue.put({'log': "Failed to click Buy button"})
+
+            select_wallets_xpath = "//button[contains(@class, 'ant-btn-primary') and .//span[text()='Select Wallets']]"
+            if click_button_with_retry(select_wallets_xpath):
+                print("Clicked Select Wallets button")
+                message_queue.put({'log': "Clicked Select Wallets button"})
+            else:
+                print("Failed to click Select Wallets button")
+                message_queue.put({'log': "Failed to click Select Wallets button"})
+
+            time.sleep(0.1)
+
+        if buy_button_clicked:
+            print("Successfully clicked Buy button")
+            message_queue.put({'log': "Successfully clicked Buy button"})
+            
+            total_time = button_click_time - extraction_time
+            trade_time = button_click_time - trade_start_time
+            
+            print(f"Time from CA extraction to Buy button click: {total_time:.2f} seconds")
+            print(f"Actual trade execution time (to Buy button click): {trade_time:.2f} seconds")
+            
+            message_queue.put({'log': f"Time from CA extraction to Buy button click: {total_time:.2f} seconds"})
+            message_queue.put({'log': f"Actual trade execution time (to Buy button click): {trade_time:.2f} seconds"})
+            
+            trade_data['status'] = 'Success'
+            trade_data['time_to_purchase'] = total_time
+            trade_data['trade_execution_time'] = trade_time
+
+            # Return to scanning Discord immediately after clicking Buy button
+            return trade_data
+
+        else:
+            print("Failed to click Buy button after maximum attempts")
+            message_queue.put({'log': "Failed to click Buy button after maximum attempts"})
+            trade_data['status'] = 'Failed'
+            trade_data['error'] = "Failed to click Buy button"
+
+    except Exception as e:
+        print(f"An error occurred while executing the trade: {str(e)}")
+        trade_data['status'] = 'Failed'
+        trade_data['error'] = f"Error: {str(e)}"
+        message_queue.put({'log': f"An error occurred while executing the trade: {str(e)}", 'error': str(e)})
+        traceback.print_exc()
+
+    log_trade(trade_data)
+    print(f"Trade executed with status: {trade_data['status']}")
+    message_queue.put({'log': f"Trade executed with status: {trade_data['status']}", 'trade': trade_data})
+    return trade_data
+
+
+
+def handle_new_token(contract_address, message_queue):
+    global last_trade_time, first_token_ignored
+    extraction_time = time.time()  # Capture the extraction time
+
+    if not first_token_ignored:
+        message_queue.put({'log': "Ignoring first token"})
+        first_token_ignored = True
+        return
+
+    current_time = time.time()
+    if current_time - last_trade_time > 5:
+        message_queue.put({'log': f"New token detected: {contract_address}"})
+        
+        # Execute trade without assigning the result to a variable
+        execute_trade(contract_address, "buy", "1e-32", 30, 0.005, message_queue, extraction_time)
+        last_trade_time = current_time
+
+        # Send only the contract address, regardless of trade success or failure
+        threading.Thread(target=send_message_to_contact, args=(contract_address,)).start()
+    else:
+        message_queue.put({'log': "Skipping trade due to cooldown period"})
+
+
+
+def click_button_with_retry(xpath, max_retries=5, retry_delay=0.1):
+    global trading_driver
+    for _ in range(max_retries):
+        try:
+            button = WebDriverWait(trading_driver, 1).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+            button.click()
+            return True
+        except:
+            time.sleep(retry_delay)
+    return False
+
+def get_latest_message_text(driver, message_queue):
+    try:
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "li[id^='chat-messages-']")))
+        message_containers = driver.find_elements(By.CSS_SELECTOR, "li[id^='chat-messages-']")
+
+        if message_containers:
+            latest_message_container = message_containers[-1]
+            driver.execute_script("arguments[0].scrollIntoView(true);", latest_message_container)
+            time.sleep(0.5)
+
+            message_text = latest_message_container.text
+            message_queue.put({'log': f"Extracted text: {message_text}"})
+            return message_text.strip()
+        else:
+            return ""
+    except Exception as e:
+        message_queue.put({'log': f"Error in get_latest_message_text: {str(e)}"})
+        return ""
+
+
+def open_discord_and_screenshot(message_queue):
+    global sniper_running, trading_driver
+    sniper_running = True
+    
+    open_trading_browser()
+    
+    discord_url = NEW_WIF_CHANNEL
+    chrome_options = Options()
+    discord_profile_dir = os.path.join(base_user_data_dir, 'discord_profile')
+    os.makedirs(discord_profile_dir, exist_ok=True)
+    chrome_options.add_argument(f"user-data-dir={discord_profile_dir}")
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--window-size=1920,1080")
+    #chrome_options.add_argument("--headless=new")
+
+    driver = None
+    csv_file = None
+
+    try:
+        service = ChromeService(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+
+        csv_path = os.path.join(os.path.dirname(__file__), 'discord_content.csv')
+        csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['Timestamp', 'URL', 'Page Title', 'Message Text', 'Extracted CA'])
+
+        driver.get(discord_url)
+        WebDriverWait(driver, 30).until(lambda d: d.execute_script('return document.readyState') == 'complete')
+
+        message_queue.put({'log': f"Current URL after navigation: {driver.current_url}"})
+
+        try:
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "li[id^='chat-messages-']"))
+            )
+            message_queue.put({'log': "Channel loaded successfully"})
+        except Exception as e:
+            message_queue.put({'log': f"Error while waiting for channel to load: {str(e)}"})
+
+        last_ca = ''
+
+        while sniper_running:
+            message_queue.put({'log': "Entering main loop"})
+            current_url = driver.current_url
+            message_queue.put({'log': f"\nCurrent URL: {current_url}"})
+            message_queue.put({'log': f"Page title: {driver.title}"})
+
+            loop_start_time = time.time()
+
+            try:
+                message_text = get_latest_message_text(driver, message_queue)
+                message_queue.put({'log': f"Raw message text: {message_text}"})
+
+                ca_match = re.search(r'\b[A-Za-z0-9]{32,}\b', message_text)
+                current_ca = ca_match.group(0) if ca_match else None
+                message_queue.put({'log': f"Extracted CA: {current_ca}"})
+            except Exception as e:
+                message_queue.put({'log': f"Failed to extract latest message or CA: {str(e)}"})
+                message_text = ""
+                current_ca = None
+
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if current_ca and current_ca != last_ca:
+                message_queue.put({'ca': current_ca, 'log': f"New CA found: {current_ca}"})
+                handle_new_token(current_ca, message_queue)
+                last_ca = current_ca
+
+            csv_writer.writerow([timestamp, current_url, driver.title, message_text, current_ca])
+            csv_file.flush()
+
+            message_queue.put({'log': f"Message Text: {message_text}"})
+            message_queue.put({'log': f"Extracted CA: {current_ca}"})
+
+            loop_end_time = time.time()
+            loop_duration = loop_end_time - loop_start_time
+
+            message_queue.put({'log': f"Total loop time: {loop_duration:.2f}s"})
+
+            if loop_duration < 1:
+                time.sleep(1 - loop_duration)
+            elif loop_duration > 5:
+                message_queue.put({'log': "Warning: Processing is taking too long. Consider optimizing."})
+
+    except Exception as e:
+        message_queue.put({'log': f"An error occurred: {str(e)}"})
+        message_queue.put({'log': f"Traceback: {traceback.format_exc()}"})
+    finally:
+        if driver:
+            driver.quit()
+        if csv_file:
+            csv_file.close()
+        if trading_driver:
+            trading_driver.quit()
+        force_quit_chromedriver()
+
+
+
+
+def start_sniper(message_queue):
+    global sniper_running
+    sniper_running = True
+    threading.Thread(target=open_discord_and_screenshot, args=(message_queue,), daemon=True).start()
+
+def stop_sniper():
+    global sniper_running, trading_driver
+    sniper_running = False
+    if trading_driver:
+        trading_driver.quit()
+
+def main():
+    message_queue = queue.Queue()
+
+    try:
+        root = tk.Tk()
+        SniperApp(root,
+                        start_sniper_func=lambda: start_sniper(message_queue),
+                        stop_sniper_func=stop_sniper,
+                        message_queue=message_queue)
+
+        root.mainloop()
+    except Exception as e:
+        error_message = str(e)
+        print(f"An unexpected error occurred: {error_message}")
+        print(traceback.format_exc())
+        threading.Thread(target=send_message_to_contact, args=(error_message,)).start()
+    finally:
+        stop_sniper()
+
+if __name__ == "__main__":
+    main()
+
+        --------------------------------------------------
+    ├── telegram_wif_retrade.py
+        Content:
+        import os
+import time
+import csv
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
+import re
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
+import queue
+from twilio.rest import Client
+import traceback
+import threading
+import psutil
+from PIL import Image
+import io
+import tkinter as tk
+from sniper_gui import SniperApp
+from telethon import TelegramClient
+from telethon.tl.types import InputPeerUser
+from telethon.tl.functions.contacts import ResolveUsernameRequest
+import asyncio
+
+# Load environment variables
+load_dotenv()
+
+# Load environment variables
+# Get the API ID, API Hash, and phone number from environment variables
+# Global variables
+ALPHA_CHANNEL = "https://web.telegram.org/k/#-1597566493"
+#ALPHA_CHANNEL = "https://web.telegram.org/k/#@rektjourney"
+
+#ALPHA_CHANNEL = "https://web.telegram.org/k/#@bobbyrookrook"
+
+API_ID = os.getenv('TELEGRAM_API_ID')
+API_HASH = os.getenv('TELEGRAM_API_HASH')
+PHONE_NUMBER = os.getenv('TELEGRAM_PHONE_NUMBER')
+CONTACT_USERNAME = os.getenv('TELEGRAM_CONTACT_USERNAME')
+
+sniper_running = False
+last_trade_time = 0
+first_token_ignored = False
+trading_driver = None
+# Create a Telegram client
+telegram_client = TelegramClient('session', API_ID, API_HASH)
+
+
+
+
+# Base user data directory for Chrome profiles
+base_user_data_dir = os.path.join(os.getcwd(), 'chrome_profiles')
+os.makedirs(base_user_data_dir, exist_ok=True)
+
+async def send_telegram_message(message_content):
+    try:
+        await telegram_client.start(phone=PHONE_NUMBER)
+
+        # Resolve the username to get the user's ID
+        contact = await telegram_client(ResolveUsernameRequest(CONTACT_USERNAME))
+        user_id = contact.peer.user_id
+
+        # Get the InputPeerUser object
+        contact = InputPeerUser(user_id, contact.users[0].access_hash)
+
+        # Send the message
+        await telegram_client.send_message(contact, message_content)
+        print("Telegram message sent successfully!")
+        
+        await telegram_client.disconnect()
+        return True
+    except Exception as e:
+        print(f"Error sending Telegram message: {str(e)}")
+        return False
+
+# Function to run the async function
+def send_message_to_contact(message_content):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(send_telegram_message(message_content))
+    finally:
+        loop.close()
+
+def log_trade(trade_data, log_file='trade_logs.csv'):
+    fieldnames = ['timestamp', 'action', 'contract_address', 'amount', 'slippage', 'priority_fee', 'signature', 'status', 'error']
+    file_exists = os.path.isfile(log_file)
+
+    with open(log_file, 'a', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(trade_data)
+
+def force_quit_chromedriver():
+    for proc in psutil.process_iter(['pid', 'name']):
+        if 'chromedriver' in proc.info['name'].lower():
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                proc.kill()
+
+def open_trading_browser():
+    global trading_driver
+    service = ChromeService(ChromeDriverManager().install())
+    chrome_options = Options()
+
+    # Use a persistent profile directory
+    trading_profile_dir = os.path.join(base_user_data_dir, 'trading_profile')
+    os.makedirs(trading_profile_dir, exist_ok=True)
+    chrome_options.add_argument(f"user-data-dir={trading_profile_dir}")
+    
+    # Add necessary arguments
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--start-maximized")
+    #chrome_options.add_argument("--headless=new")
+
+    trading_driver = webdriver.Chrome(service=service, options=chrome_options)
+    trading_driver.get("https://bullx.io/")  # Load the initial page
+
+def check_order_status(driver, timeout=30):
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            # Look for the specific button that indicates order status
+            buttons = driver.find_elements(By.CSS_SELECTOR, "button[id^='radix-:r'][class*='border-red-900'], button[id^='radix-:r'][class*='border-green-900']")
+            for button in buttons:
+                if "border-red-900" in button.get_attribute("class"):
+                    # Check for the close icon inside the button
+                    close_icon = button.find_elements(By.CSS_SELECTOR, "span.anticon-close")
+                    if close_icon:
+                        return "failed"
+                elif "border-green-900" in button.get_attribute("class"):
+                    return "success"
+            # If neither success nor failure is detected, wait and try again
+            time.sleep(1)
+        except Exception as e:
+            print(f"Error checking order status: {str(e)}")
+            time.sleep(1)
+    return "timeout"
+
+def execute_trade(contract_address, action, amount, slippage, priority_fee, message_queue, extraction_time):
+    global trading_driver
+    trade_start_time = time.time()
+    trade_data = {
+        'timestamp': datetime.now().isoformat(),
+        'action': action,
+        'contract_address': contract_address,
+        'amount': amount,
+        'slippage': slippage,
+        'priority_fee': priority_fee,
+        'signature': None,
+        'status': 'Initiated',
+        'error': None
+    }
+
+    try:
+        print(f"Attempting to execute trade for {contract_address}")
+        message_queue.put({'log': f"Attempting to execute trade for {contract_address}"})
+        
+        trading_url = f'https://bullx.io/terminal?chainId=1399811149&address={contract_address}'
+        trading_driver.get(trading_url)
+
+        WebDriverWait(trading_driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        
+        print(f"Loaded trading page: {trading_url}")
+        message_queue.put({'log': f"Loaded trading page: {trading_url}"})
+
+        time.sleep(0.3)
+
+        max_attempts = 5
+        attempt = 0
+        buy_button_clicked = False
+        retrade = False
+
+        while attempt < max_attempts and not buy_button_clicked:
+            attempt += 1
+            print(f"Attempt {attempt} to click buttons")
+            message_queue.put({'log': f"Attempt {attempt} to click buttons"})
+
+            preset_button_xpath = f"//button[contains(@class, 'ant-btn-default') and contains(@class, 'flex-1') and .//span[text()='{amount}']]"
+            if click_button_with_retry(preset_button_xpath):
+                print(f"Clicked preset button: {amount}")
+                message_queue.put({'log': f"Clicked preset button: {amount}"})
+                time.sleep(0.3)
+            else:
+                print(f"Failed to click preset button: {amount}")
+                message_queue.put({'log': f"Failed to click preset button: {amount}"})
+
+            buy_button_xpath = "//button[contains(@class, 'ant-btn-primary') and contains(., 'Buy')]"
+            if click_button_with_retry(buy_button_xpath):
+                button_click_time = time.time()
+                print("Clicked Buy button")
+                message_queue.put({'log': "Clicked Buy button"})
+                buy_button_clicked = True
+                break
+            else:
+                print("Failed to click Buy button")
+                message_queue.put({'log': "Failed to click Buy button"})
+
+            select_wallets_xpath = "//button[contains(@class, 'ant-btn-primary') and .//span[text()='Select Wallets']]"
+            if click_button_with_retry(select_wallets_xpath):
+                print("Clicked Select Wallets button")
+                message_queue.put({'log': "Clicked Select Wallets button"})
+            else:
+                print("Failed to click Select Wallets button")
+                message_queue.put({'log': "Failed to click Select Wallets button"})
+
+            time.sleep(0.1)
+
+        if buy_button_clicked:
+            print("Successfully clicked Buy button")
+            message_queue.put({'log': "Successfully clicked Buy button"})
+            
+            # Continuously check the trade status
+            start_time = time.time()
+            while time.time() - start_time < 30:  # Check for 30 seconds max
+                trade_status = check_order_status(trading_driver)
+                
+                if trade_status == "failed" and not retrade:
+                    print("First trade failed. Attempting retrade.")
+                    message_queue.put({'log': "First trade failed. Attempting retrade."})
+                    
+                    # Attempt retrade
+                    retrade = True
+                    retry_count = 0
+                    max_retries = 5
+                    while retry_count < max_retries:
+                        # Click preset button again
+                        preset_button_xpath = f"//button[contains(@class, 'ant-btn-default') and contains(@class, 'flex-1') and .//span[text()='{amount}']]"
+                        if click_button_with_retry(preset_button_xpath):
+                            print(f"Clicked preset button for retrade: {amount}")
+                            message_queue.put({'log': f"Clicked preset button for retrade: {amount}"})
+                        else:
+                            print(f"Failed to click preset button for retrade: {amount}")
+                            message_queue.put({'log': f"Failed to click preset button for retrade: {amount}"})
+                        
+                        # Click Buy button again
+                        buy_button_xpath = "//button[contains(@class, 'ant-btn-primary') and contains(., 'Buy')]"
+                        if click_button_with_retry(buy_button_xpath):
+                            print("Clicked Buy button for retrade")
+                            message_queue.put({'log': "Clicked Buy button for retrade"})
+                            break
+                        else:
+                            print("Failed to click Buy button for retrade, retrying…")
+                            message_queue.put({'log': "Failed to click Buy button for retrade, retrying…"})
+                            retry_count += 1
+                            time.sleep(0.5)
+                    else:
+                        print("Failed to click Buy button for retrade after maximum retries")
+                        message_queue.put({'log': "Failed to click Buy button for retrade after maximum retries"})
+                        trade_data['status'] = 'Failed (Retrade)'
+                        break
+                    
+                    # Wait for the retrade to confirm
+                    retrade_start_time = time.time()
+                    while time.time() - retrade_start_time < 30:  # Check for 30 seconds max
+                        retrade_status = check_order_status(trading_driver)
+                        if retrade_status == "success":
+                            trade_data['status'] = 'Success (Retrade)'
+                            break
+                        elif retrade_status == "failed":
+                            trade_data['status'] = 'Failed (Retrade)'
+                            break
+                        time.sleep(0.5)
+                    else:
+                        trade_data['status'] = 'Pending (Retrade)'
+                elif trade_status == "success":
+                    trade_data['status'] = 'Success'
+                    break
+                elif trade_status == "failed" and retrade:
+                    trade_data['status'] = 'Failed (Retrade)'
+                    break
+                
+                time.sleep(0.5)
+            else:
+                trade_data['status'] = 'Pending'
+            
+            total_time = button_click_time - extraction_time
+            trade_time = button_click_time - trade_start_time
+            
+            print(f"Time from CA extraction to Buy button click: {total_time:.2f} seconds")
+            print(f"Actual trade execution time (to Buy button click): {trade_time:.2f} seconds")
+            
+            message_queue.put({'log': f"Time from CA extraction to Buy button click: {total_time:.2f} seconds"})
+            message_queue.put({'log': f"Actual trade execution time (to Buy button click): {trade_time:.2f} seconds"})
+            
+            trade_data['time_to_purchase'] = total_time
+            trade_data['trade_execution_time'] = trade_time
+
+        else:
+            print("Failed to click Buy button after maximum attempts")
+            message_queue.put({'log': "Failed to click Buy button after maximum attempts"})
+            trade_data['status'] = 'Failed'
+            trade_data['error'] = "Failed to click Buy button"
+
+    except Exception as e:
+        print(f"An error occurred while executing the trade: {str(e)}")
+        trade_data['status'] = 'Failed'
+        trade_data['error'] = f"Error: {str(e)}"
+        message_queue.put({'log': f"An error occurred while executing the trade: {str(e)}", 'error': str(e)})
+        traceback.print_exc()
+    else:
+        log_trade(trade_data)
+        print(f"Trade executed with status: {trade_data['status']}")
+        message_queue.put({'log': f"Trade executed with status: {trade_data['status']}", 'trade': trade_data})
+    finally:
+        return trade_data
+
+
+
+traded_cas = []
+
+def handle_new_token(contract_address, message_queue):
+    global last_trade_time, traded_cas
+    extraction_time = time.time()  # Capture the extraction time
+
+    current_time = time.time()
+    if current_time - last_trade_time > 5:
+        message_queue.put({'log': f"New token detected: {contract_address}"})
+        
+        if contract_address not in traded_cas:
+            traded_cas.append(contract_address)
+            # Execute trade without assigning the result to a variable
+            execute_trade(contract_address, "buy", "1e-32", 30, 0.005, message_queue, extraction_time)
+            last_trade_time = current_time
+
+            # Send only the contract address, regardless of trade success or failure
+            threading.Thread(target=send_message_to_contact, args=(contract_address,)).start()
+        else:
+            message_queue.put({'log': f"Skipping trade for {contract_address} as it has already been traded"})
+    else:
+        message_queue.put({'log': "Skipping trade due to cooldown period"})
+
+
+def click_button_with_retry(xpath, max_retries=5, retry_delay=0.1):
+    global trading_driver
+    for _ in range(max_retries):
+        try:
+            button = WebDriverWait(trading_driver, 1).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+            button.click()
+            return True
+        except:
+            time.sleep(retry_delay)
+    return False
+
+# def get_latest_message_text(driver, message_queue):
+#     try:
+#         # Wait for the message container to be present
+#         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#column-center > div > div > div.bubbles.is-chat-input-hidden.has-groups.has-sticky-dates.scrolled-down > div.scrollable.scrollable-y > div.bubbles-inner.is-broadcast")))
+        
+#         # Find the latest message containers
+#         message_containers = driver.find_elements(By.CSS_SELECTOR, "#column-center > div > div > div.bubbles.is-chat-input-hidden.has-groups.has-sticky-dates.scrolled-down > div.scrollable.scrollable-y > div.bubbles-inner.is-broadcast > section")
+        
+#         message_texts = []
+#         contract_addresses = []
+        
+#         # Iterate over the latest 4 message containers and their respective dates
+#         for i in range(-1, -8, -1):
+#             try:
+#                 latest_message_container = message_containers[i]
+#                 message_text = latest_message_container.find_element(By.CSS_SELECTOR, "div.message.spoilers-container > span.translatable-message").text
+#                 message_queue.put({'log': f"Extracted text: {message_text}"})
+                
+#                 ca_match = re.search(r'\b[A-Za-z0-9]{32,}\b', message_text)
+#                 current_ca = ca_match.group(0) if ca_match else None
+#                 message_queue.put({'log': f"Extracted CA: {current_ca}"})
+                
+#                 message_texts.append(message_text.strip())
+#                 contract_addresses.append(current_ca)
+#             except (IndexError, NoSuchElementException):
+#                 # If the latest message container doesn't have the expected structure, move to the next one
+#                 continue
+        
+#         # Return the list of message texts and contract addresses
+#         return message_texts, contract_addresses
+    
+#     except Exception as e:
+#         message_queue.put({'log': f"Error in get_latest_message_text: {str(e)}"})
+#         return [], []
+
+
+# #works
+# def get_latest_message_text(driver, message_queue):
+#     try:
+#         # Wait for the message container to be present
+#         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#column-center > div > div > div.bubbles.is-chat-input-hidden.has-groups.has-sticky-dates.scrolled-down > div.scrollable.scrollable-y > div.bubbles-inner.is-broadcast")))
+        
+#         # Find all message containers with the latest date group
+#         latest_date_groups = driver.find_elements(By.CSS_SELECTOR, "#column-center > div > div > div.bubbles.is-chat-input-hidden.has-groups.has-sticky-dates.scrolled-down > div.scrollable.scrollable-y > div.bubbles-inner.is-broadcast > section.bubbles-date-group")
+        
+#         message_texts = []
+#         contract_addresses = []
+        
+#         # Iterate over the latest message containers
+#         for latest_date_group in latest_date_groups:
+#             try:
+#                 latest_message_container = latest_date_group.find_elements(By.CSS_SELECTOR, "div.bubbles-group > div")[-1]
+#                 message_text_element = latest_message_container.find_element(By.CSS_SELECTOR, "div.message.spoilers-container > span.translatable-message")
+#                 message_text = message_text_element.text
+#                 message_queue.put({'log': f"Extracted text: {message_text}"})
+                
+#                 ca_match = re.search(r'\b[A-Za-z0-9]{32,}\b', message_text)
+#                 current_ca = ca_match.group(0) if ca_match else None
+#                 message_queue.put({'log': f"Extracted CA: {current_ca}"})
+                
+#                 message_texts.append(message_text.strip())
+#                 contract_addresses.append(current_ca)
+#             except (IndexError, NoSuchElementException):
+#                 # If the latest message container doesn't have the expected structure, move to the next one
+#                 continue
+        
+#         # Return the list of message texts and contract addresses
+#         return message_texts, contract_addresses
+    
+#     except Exception as e:
+#         message_queue.put({'log': f"Error in get_latest_message_text: {str(e)}"})
+#         return [], []
+
+# #test rook channel 
+# def get_latest_message_text(driver, message_queue):
+#     try:
+#         # Wait for the message container to be present
+#         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//div[@class='bubbles scrolled-down has-groups has-sticky-dates']")))
+        
+#         # Find the latest message container
+#         latest_message_container = driver.find_element(By.XPATH, "//div[@class='bubbles scrolled-down has-groups has-sticky-dates']//div[@class='bubble channel-post with-beside-button hide-name is-in can-have-tail is-group-first is-group-last']")
+        
+#         # Find the message text element
+#         message_text_element = latest_message_container.find_element(By.XPATH, ".//div[@class='message spoilers-container']//span[@class='translatable-message']")
+#         message_text = message_text_element.text
+#         message_queue.put({'log': f"Extracted text: {message_text}"})
+        
+#         ca_match = re.search(r'\b[A-Za-z0-9]{32,}\b', message_text)
+#         current_ca = ca_match.group(0) if ca_match else None
+#         message_queue.put({'log': f"Extracted CA: {current_ca}"})
+        
+#         return [message_text.strip()], [current_ca]
+    
+#     except Exception as e:
+#         message_queue.put({'log': f"Error in get_latest_message_text: {str(e)}"})
+#         return [], []
+
+
+#test for sending channel:
+# def get_latest_message_text(driver, message_queue):
+#     try:
+#         # Wait for the message container to be present
+#         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#column-center > div > div > div.bubbles.is-chat-input-hidden.has-groups.has-sticky-dates.scrolled-down > div.scrollable.scrollable-y > div.bubbles-inner.is-broadcast")))
+        
+#         # Find all message containers with the latest date group
+#         latest_date_groups = driver.find_elements(By.CSS_SELECTOR, "#column-center > div > div > div.bubbles.is-chat-input-hidden.has-groups.has-sticky-dates.scrolled-down > div.scrollable.scrollable-y > div.bubbles-inner.is-broadcast > section.bubbles-date-group")
+        
+#         message_texts = []
+#         contract_addresses = []
+        
+#         # Iterate over the latest message containers
+#         for latest_date_group in latest_date_groups:
+#             try:
+#                 latest_message_container = latest_date_group.find_elements(By.CSS_SELECTOR, "div.bubbles-group > div")[-1]
+#                 message_text_element = latest_message_container.find_element(By.CSS_SELECTOR, "div.message.spoilers-container > span.translatable-message")
+#                 message_text = message_text_element.text
+#                 message_queue.put({'log': f"Extracted text: {message_text}"})
+                
+#                 ca_match = re.search(r'\b[A-Za-z0-9]{32,}\b', message_text)
+#                 if ca_match:
+#                     current_ca = ca_match.group(0)
+#                 else:
+#                     ca_match = re.search(r'Ca\s*:\s*([A-Za-z0-9]{32,})', message_text, re.IGNORECASE)
+#                     if ca_match:
+#                         current_ca = ca_match.group(1)
+#                     else:
+#                         current_ca = None
+#                 message_queue.put({'log': f"Extracted CA: {current_ca}"})
+                
+#                 message_texts.append(message_text.strip())
+#                 contract_addresses.append(current_ca)
+#             except (IndexError, NoSuchElementException):
+#                 # If the latest message container doesn't have the expected structure, move to the next one
+#                 continue
+        
+#         # Return the list of message texts and contract addresses
+#         return message_texts, contract_addresses
+    
+#     except Exception as e:
+#         message_queue.put({'log': f"Error in get_latest_message_text: {str(e)}"})
+#         return [], []
+
+
+#works but didnt trade zack morris coin for some reason
+# def get_latest_message_text(driver, message_queue):
+#     try:
+#         # Wait for the message container to be present
+#         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".bubbles-inner.is-broadcast")))
+
+#         # Find all message containers
+#         message_containers = driver.find_elements(By.CSS_SELECTOR, ".bubbles-inner.is-broadcast .bubble.channel-post")
+
+#         message_texts = []
+#         contract_addresses = []
+
+#         # Iterate over the message containers
+#         for message_container in message_containers:
+#             try:
+#                 message_text_element = message_container.find_element(By.CSS_SELECTOR, ".message.spoilers-container > span.translatable-message")
+#                 message_text = message_text_element.text
+#                 message_queue.put({'log': f"Extracted text: {message_text}"})
+
+#                 ca_match = re.search(r'CA\s*:\s*([A-Za-z0-9]{32,})|([A-Za-z0-9]{32,})', message_text, re.IGNORECASE)
+#                 if ca_match:
+#                     current_ca = ca_match.group(1) if ca_match.group(1) else ca_match.group(2)
+#                 else:
+#                     current_ca = None
+#                 message_queue.put({'log': f"Extracted CA: {current_ca}"})
+
+#                 message_texts.append(message_text.strip())
+#                 contract_addresses.append(current_ca)
+#             except (NoSuchElementException):
+#                 # If the message container doesn't have the expected structure, move to the next one
+#                 continue
+
+#         # Return the list of message texts and contract addresses
+#         return message_texts, contract_addresses
+
+#     except Exception as e:
+#         message_queue.put({'log': f"Error in get_latest_message_text: {str(e)}"})
+#         return [], []
+#works but extracts url sometimes
+# def get_latest_message_text(driver, message_queue):
+#     try:
+#         # Wait for the message container to be present
+#         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".bubbles-inner.is-broadcast")))
+
+#         # Find all message containers
+#         message_containers = driver.find_elements(By.CSS_SELECTOR, ".bubbles-inner.is-broadcast .bubble.channel-post")
+
+#         message_texts = []
+#         contract_addresses = []
+
+#         # Iterate over the message containers
+#         for message_container in message_containers:
+#             try:
+#                 message_text_element = message_container.find_element(By.CSS_SELECTOR, ".message.spoilers-container > span.translatable-message")
+#                 message_text = message_text_element.text
+#                 message_queue.put({'log': f"Extracted text: {message_text}"})
+
+#                 ca_match = re.search(r'CA\s*:\s*([A-Za-z0-9]{32,})|([A-Za-z0-9]{32,})', message_text, re.IGNORECASE)
+#                 if ca_match:
+#                     current_ca = ca_match.group(1) if ca_match.group(1) else ca_match.group(2)
+#                     message_queue.put({'log': f"Extracted CA: {current_ca}"})
+#                     handle_new_token(current_ca, message_queue)
+#                 else:
+#                     message_queue.put({'log': f"Extracted CA: None"})
+
+#                 message_texts.append(message_text.strip())
+#                 contract_addresses.append(current_ca)
+#             except (NoSuchElementException):
+#                 # If the message container doesn't have the expected structure, move to the next one
+#                 continue
+
+#         # Return the list of message texts and contract addresses
+#         return message_texts, contract_addresses
+
+#     except Exception as e:
+#         message_queue.put({'log': f"Error in get_latest_message_text: {str(e)}"})
+#         return [], []
+def get_latest_message_text(driver, message_queue):
+    try:
+        # Wait for the message container to be present
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".bubbles-inner.is-broadcast")))
+
+        # Find all message containers
+        message_containers = driver.find_elements(By.CSS_SELECTOR, ".bubbles-inner.is-broadcast .bubble.channel-post")
+
+        message_texts = []
+        contract_addresses = []
+
+        # Iterate over the message containers
+        for message_container in message_containers:
+            try:
+                message_text_element = message_container.find_element(By.CSS_SELECTOR, ".message.spoilers-container > span.translatable-message")
+                message_text = message_text_element.text
+                message_queue.put({'log': f"Extracted text: {message_text}"})
+
+                # Remove URLs from the text
+                urls = re.findall(r'https?://[^\s]+', message_text)
+                for url in urls:
+                    message_text = message_text.replace(url, '')
+
+                ca_match = re.search(r'\b[A-Za-z0-9]{32,}\b', message_text)
+                if ca_match:
+                    current_ca = ca_match.group(0)
+                    message_queue.put({'log': f"Extracted CA: {current_ca}"})
+                    handle_new_token(current_ca, message_queue)
+                else:
+                    ca_match = re.search(r'CA\s*:\s*([A-Za-z0-9]{32,})', message_text, re.IGNORECASE)
+                    if ca_match:
+                        current_ca = ca_match.group(1)
+                        message_queue.put({'log': f"Extracted CA: {current_ca}"})
+                        handle_new_token(current_ca, message_queue)
+                    else:
+                        message_queue.put({'log': f"Extracted CA: None"})
+                        current_ca = None
+
+                message_texts.append(message_text.strip())
+                contract_addresses.append(current_ca)
+            except (NoSuchElementException):
+                # If the message container doesn't have the expected structure, move to the next one
+                continue
+
+        # Return the list of message texts and contract addresses
+        return message_texts, contract_addresses
+
+    except Exception as e:
+        message_queue.put({'log': f"Error in get_latest_message_text: {str(e)}"})
+        return [], []
+
+
+def open_discord_and_screenshot(message_queue):
+    global sniper_running, trading_driver
+    sniper_running = True
+    
+    open_trading_browser()
+    
+    discord_url = ALPHA_CHANNEL
+    chrome_options = Options()
+    discord_profile_dir = os.path.join(base_user_data_dir, 'discord_profile')
+    os.makedirs(discord_profile_dir, exist_ok=True)
+    chrome_options.add_argument(f"user-data-dir={discord_profile_dir}")
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--window-size=1920,1080")
+    #chrome_options.add_argument("--headless=new")
+
+    driver = None
+    csv_file = None
+
+    try:
+        service = ChromeService(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+
+        csv_path = os.path.join(os.path.dirname(__file__), 'discord_content.csv')
+        csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['Timestamp', 'URL', 'Page Title', 'Message Text', 'Extracted CA', 'Message Date'])
+
+        driver.get(discord_url)
+        WebDriverWait(driver, 30).until(lambda d: d.execute_script('return document.readyState') == 'complete')
+
+        message_queue.put({'log': f"Current URL after navigation: {driver.current_url}"})
+
+        try:
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#column-center > div > div > div.bubbles.is-chat-input-hidden.has-groups.has-sticky-dates.scrolled-down > div.scrollable.scrollable-y > div.bubbles-inner.is-broadcast"))
+            )
+            message_queue.put({'log': "Channel loaded successfully"})
+        except Exception as e:
+            message_queue.put({'log': f"Error while waiting for channel to load: {str(e)}"})
+
+        last_ca = ''
+
+        while sniper_running:
+            message_queue.put({'log': "Entering main loop"})
+            current_url = driver.current_url
+            message_queue.put({'log': f"\nCurrent URL: {current_url}"})
+            message_queue.put({'log': f"Page title: {driver.title}"})
+
+            loop_start_time = time.time()
+
+            try:
+                message_texts, contract_addresses = get_latest_message_text(driver, message_queue)
+                
+                #debugging remove later: 
+                        # Print the raw message content in the terminal
+                # for i, message_text in enumerate(message_texts):
+                #     print(f"Raw Message Text {i+1}: {message_text}")
+
+                # for i, current_ca in enumerate(contract_addresses):
+                #     print(f"Extracted CA {i+1}: {current_ca}")
+                
+                for i, (message_text, current_ca) in enumerate(zip(message_texts, contract_addresses)):
+                    message_queue.put({'log': f"Raw message text {i+1}: {message_text}"})
+                    
+                    if current_ca and current_ca != last_ca:
+                        message_queue.put({'ca': current_ca, 'log': f"New CA found {i+1}: {current_ca}"})
+                        handle_new_token(current_ca, message_queue)
+                        last_ca = current_ca
+                        # Send a telegram message to the bullx channel
+                        threading.Thread(target=send_message_to_contact, args=("New message detected!",)).start()
+                    
+                    # Extract the message date
+                    message_date_element = driver.find_elements(By.CSS_SELECTOR, f"#column-center > div > div > div.bubbles.is-chat-input-hidden.has-groups.has-sticky-dates.scrolled-down > div.scrollable.scrollable-y > div.bubbles-inner.is-broadcast > section.bubbles-date-group")[-1]
+                    message_date = message_date_element.find_element(By.CSS_SELECTOR, "div.bubble.service.is-date > div.bubble-content > div.service-msg > span.i18n").text
+                    
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    csv_writer.writerow([timestamp, current_url, driver.title, message_text, current_ca, message_date])
+                    csv_file.flush()
+
+                    message_queue.put({'log': f"Message Text {i+1}: {message_text}"})
+                    message_queue.put({'log': f"Extracted CA {i+1}: {current_ca}"})
+                    message_queue.put({'log': f"Message Date {i+1}: {message_date}"})
+
+            except Exception as e:
+                message_queue.put({'log': f"Failed to extract latest messages or CAs: {str(e)}"})
+
+            loop_end_time = time.time()
+            loop_duration = loop_end_time - loop_start_time
+
+            message_queue.put({'log': f"Total loop time: {loop_duration:.2f}s"})
+
+            if loop_duration < 1:
+                time.sleep(1 - loop_duration)
+            elif loop_duration > 5:
+                message_queue.put({'log': "Warning: Processing is taking too long. Consider optimizing."})
+
+    except Exception as e:
+        message_queue.put({'log': f"An error occurred: {str(e)}"})
+        message_queue.put({'log': f"Traceback: {traceback.format_exc()}"})
+    finally:
+        if driver:
+            driver.quit()
+        if csv_file:
+            csv_file.close()
+        if trading_driver:
+            trading_driver.quit()
+        force_quit_chromedriver()
+
+
+def start_sniper(message_queue):
+    global sniper_running
+    sniper_running = True
+    threading.Thread(target=open_discord_and_screenshot, args=(message_queue,), daemon=True).start()
+
+def stop_sniper():
+    global sniper_running, trading_driver
+    sniper_running = False
+    if trading_driver:
+        trading_driver.quit()
+
+def main():
+    message_queue = queue.Queue()
+
+    try:
+        root = tk.Tk()
+        SniperApp(root,
+                        start_sniper_func=lambda: start_sniper(message_queue),
+                        stop_sniper_func=stop_sniper,
+                        message_queue=message_queue)
+
+        root.mainloop()
+    except Exception as e:
+        error_message = str(e)
+        print(f"An unexpected error occurred: {error_message}")
+        print(traceback.format_exc())
+        threading.Thread(target=send_message_to_contact, args=(error_message,)).start()
+    finally:
+        stop_sniper()
+
+if __name__ == "__main__":
+    main()
+
+        --------------------------------------------------
+    └── tkickz_script.py
+        Content:
+        import os
+import time
+import csv
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
+import re
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
+import queue
+from twilio.rest import Client
+import traceback
+import threading
+import psutil
+from PIL import Image
+import io
+import tkinter as tk
+from sniper_gui import SniperApp
+from telethon import TelegramClient
+from telethon.tl.types import InputPeerUser
+from telethon.tl.functions.contacts import ResolveUsernameRequest
+import asyncio
+import re
+
+# Load environment variables
+load_dotenv()
+
+# Load environment variables
+# Get the API ID, API Hash, and phone number from environment variables
+# Global variables
+PRO_CHAT_CHANNEL = os.getenv('PRO_CHAT_CHANNEL')
+
+API_ID = os.getenv('TELEGRAM_API_ID')
+API_HASH = os.getenv('TELEGRAM_API_HASH')
+PHONE_NUMBER = os.getenv('TELEGRAM_PHONE_NUMBER')
+CONTACT_USERNAME = os.getenv('TELEGRAM_CONTACT_USERNAME')
+
+sniper_running = False
+last_trade_time = 0
+first_token_ignored = False
+trading_driver = None
+# Create a Telegram client
+telegram_client = TelegramClient('session', API_ID, API_HASH)
+
+
+
+
+# Base user data directory for Chrome profiles
+base_user_data_dir = os.path.join(os.getcwd(), 'chrome_profiles')
+os.makedirs(base_user_data_dir, exist_ok=True)
+
+async def send_telegram_message(message_content):
+    try:
+        await telegram_client.start(phone=PHONE_NUMBER)
+
+        # Resolve the username to get the user's ID
+        contact = await telegram_client(ResolveUsernameRequest(CONTACT_USERNAME))
+        user_id = contact.peer.user_id
+
+        # Get the InputPeerUser object
+        contact = InputPeerUser(user_id, contact.users[0].access_hash)
+
+        # Send the message
+        await telegram_client.send_message(contact, message_content)
+        print("Telegram message sent successfully!")
+        
+        await telegram_client.disconnect()
+        return True
+    except Exception as e:
+        print(f"Error sending Telegram message: {str(e)}")
+        return False
+
+# Function to run the async function
+def send_message_to_contact(message_content):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(send_telegram_message(message_content))
+    finally:
+        loop.close()
+
+def log_trade(trade_data, log_file='trade_logs.csv'):
+    fieldnames = ['timestamp', 'action', 'contract_address', 'amount', 'slippage', 'priority_fee', 'signature', 'status', 'error']
+    file_exists = os.path.isfile(log_file)
+
+    with open(log_file, 'a', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(trade_data)
+
+def force_quit_chromedriver():
+    for proc in psutil.process_iter(['pid', 'name']):
+        if 'chromedriver' in proc.info['name'].lower():
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                proc.kill()
+
+def open_trading_browser():
+    global trading_driver
+    service = ChromeService(ChromeDriverManager().install())
+    chrome_options = Options()
+
+    # Use a persistent profile directory
+    trading_profile_dir = os.path.join(base_user_data_dir, 'trading_profile')
+    os.makedirs(trading_profile_dir, exist_ok=True)
+    chrome_options.add_argument(f"user-data-dir={trading_profile_dir}")
+    
+    # Add necessary arguments
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--start-maximized")
+    #chrome_options.add_argument("--headless=new")
+
+    trading_driver = webdriver.Chrome(service=service, options=chrome_options)
+    trading_driver.get("https://bullx.io/")  # Load the initial page
+
+def execute_trade(contract_address, action, amount, slippage, priority_fee, message_queue, extraction_time):
+    global trading_driver
+    trade_start_time = time.time()
+    trade_data = {
+        'timestamp': datetime.now().isoformat(),
+        'action': action,
+        'contract_address': contract_address,
+        'amount': amount,
+        'slippage': slippage,
+        'priority_fee': priority_fee,
+        'signature': None,
+        'status': 'Initiated',
+        'error': None
+    }
+
+    try:
+        print(f"Attempting to execute trade for {contract_address}")
+        message_queue.put({'log': f"Attempting to execute trade for {contract_address}"})
+        
+        trading_url = f'https://bullx.io/terminal?chainId=1399811149&address={contract_address}'
+        trading_driver.get(trading_url)
+
+        WebDriverWait(trading_driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
+        
+        print(f"Loaded trading page: {trading_url}")
+        message_queue.put({'log': f"Loaded trading page: {trading_url}"})
+
+        time.sleep(0.3)
+
+        max_attempts = 5
+        attempt = 0
+        buy_button_clicked = False
+
+        while attempt < max_attempts and not buy_button_clicked:
+            attempt += 1
+            print(f"Attempt {attempt} to click buttons")
+            message_queue.put({'log': f"Attempt {attempt} to click buttons"})
+
+            preset_button_xpath = f"//button[contains(@class, 'ant-btn-default') and contains(@class, 'flex-1') and .//span[text()='{amount}']]"
+            if click_button_with_retry(preset_button_xpath):
+                print(f"Clicked preset button: {amount}")
+                message_queue.put({'log': f"Clicked preset button: {amount}"})
+                time.sleep(0.3)
+            else:
+                print(f"Failed to click preset button: {amount}")
+                message_queue.put({'log': f"Failed to click preset button: {amount}"})
+
+            buy_button_xpath = "//button[contains(@class, 'ant-btn-primary') and contains(., 'Buy')]"
+            if click_button_with_retry(buy_button_xpath):
+                button_click_time = time.time()
+                print("Clicked Buy button")
+                message_queue.put({'log': "Clicked Buy button"})
+                buy_button_clicked = True
+                break
+            else:
+                print("Failed to click Buy button")
+                message_queue.put({'log': "Failed to click Buy button"})
+
+            select_wallets_xpath = "//button[contains(@class, 'ant-btn-primary') and .//span[text()='Select Wallets']]"
+            if click_button_with_retry(select_wallets_xpath):
+                print("Clicked Select Wallets button")
+                message_queue.put({'log': "Clicked Select Wallets button"})
+            else:
+                print("Failed to click Select Wallets button")
+                message_queue.put({'log': "Failed to click Select Wallets button"})
+
+            time.sleep(0.1)
+
+        if buy_button_clicked:
+            print("Successfully clicked Buy button")
+            message_queue.put({'log': "Successfully clicked Buy button"})
+            
+            total_time = button_click_time - extraction_time
+            trade_time = button_click_time - trade_start_time
+            
+            print(f"Time from CA extraction to Buy button click: {total_time:.2f} seconds")
+            print(f"Actual trade execution time (to Buy button click): {trade_time:.2f} seconds")
+            
+            message_queue.put({'log': f"Time from CA extraction to Buy button click: {total_time:.2f} seconds"})
+            message_queue.put({'log': f"Actual trade execution time (to Buy button click): {trade_time:.2f} seconds"})
+            
+            trade_data['status'] = 'Success'
+            trade_data['time_to_purchase'] = total_time
+            trade_data['trade_execution_time'] = trade_time
+
+            # Return to scanning Discord immediately after clicking Buy button
+            return trade_data
+
+        else:
+            print("Failed to click Buy button after maximum attempts")
+            message_queue.put({'log': "Failed to click Buy button after maximum attempts"})
+            trade_data['status'] = 'Failed'
+            trade_data['error'] = "Failed to click Buy button"
+
+    except Exception as e:
+        print(f"An error occurred while executing the trade: {str(e)}")
+        trade_data['status'] = 'Failed'
+        trade_data['error'] = f"Error: {str(e)}"
+        message_queue.put({'log': f"An error occurred while executing the trade: {str(e)}", 'error': str(e)})
+        traceback.print_exc()
+
+    log_trade(trade_data)
+    print(f"Trade executed with status: {trade_data['status']}")
+    message_queue.put({'log': f"Trade executed with status: {trade_data['status']}", 'trade': trade_data})
+    return trade_data
+
+traded_coins = set()
+
+def handle_new_token(contract_address, message_queue):
+    global last_trade_time, first_token_ignored
+    extraction_time = time.time()  # Capture the extraction time
+
+    if not first_token_ignored:
+        message_queue.put({'log': "Ignoring first token"})
+        first_token_ignored = True
+        return
+
+    if contract_address in traded_coins:
+        message_queue.put({'log': f"Skipping trade for {contract_address} as it has already been traded"})
+        return
+
+    current_time = time.time()
+    if current_time - last_trade_time > 5:
+        message_queue.put({'log': f"New token detected: {contract_address}"})
+        
+        # Execute trade without assigning the result to a variable
+        execute_trade(contract_address, "buy", "1e-32", 30, 0.005, message_queue, extraction_time)
+        last_trade_time = current_time
+
+        # Add the contract address to the set of traded coins
+        traded_coins.add(contract_address)
+
+        # Send only the contract address, regardless of trade success or failure
+        threading.Thread(target=send_message_to_contact, args=(contract_address,)).start()
+    else:
+        message_queue.put({'log': "Skipping trade due to cooldown period"})
+
+def click_button_with_retry(xpath, max_retries=5, retry_delay=0.1):
+    global trading_driver
+    for _ in range(max_retries):
+        try:
+            button = WebDriverWait(trading_driver, 1).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+            button.click()
+            return True
+        except:
+            time.sleep(retry_delay)
+    return False
+
+import re
+
+def get_latest_message_text(driver, message_queue):
+    try:
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "li[id^='chat-messages-']")))
+        message_containers = driver.find_elements(By.CSS_SELECTOR, "li[id^='chat-messages-']")
+
+        if message_containers:
+            latest_message_container = message_containers[-1]
+            driver.execute_script("arguments[0].scrollIntoView(true);", latest_message_container)
+            time.sleep(0.5)
+
+            message_text = latest_message_container.text
+            message_queue.put({'log': f"Extracted text: {message_text}"})
+            return message_text.strip()
+        else:
+            return ""
+    except Exception as e:
+        message_queue.put({'log': f"Error in get_latest_message_text: {str(e)}"})
+        return ""
+
+def extract_ca_from_message(message_text):
+    ca_match = re.search(r'\b[A-Za-z0-9]{32,}\b', message_text)
+    return ca_match.group(0) if ca_match else None
+
+def check_for_tkickz_message(driver, message_queue):
+    try:
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "li[id^='chat-messages-']")))
+        message_containers = driver.find_elements(By.CSS_SELECTOR, "li[id^='chat-messages-']")
+
+        if message_containers:
+            latest_message_container = message_containers[-1]
+            driver.execute_script("arguments[0].scrollIntoView(true);", latest_message_container)
+            time.sleep(0.5)
+
+            message_text = latest_message_container.text
+            message_queue.put({'log': f"Extracted text: {message_text}"})
+
+            if "Tkickz" in message_text:
+                ca = extract_ca_from_message(message_text)
+                if ca:
+                    message_queue.put({'ca': ca, 'log': f"New CA found from Tkickz: {ca}"})
+                    handle_new_token(ca, message_queue)
+    except Exception as e:
+        message_queue.put({'log': f"Error in check_for_tkickz_message: {str(e)}"})
+def get_latest_messages(driver, message_queue):
+    try:
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "li[id^='chat-messages-']")))
+        message_containers = driver.find_elements(By.CSS_SELECTOR, "li[id^='chat-messages-']")
+
+        if message_containers:
+            latest_messages = message_containers[-3:]
+            for message in latest_messages:
+                driver.execute_script("arguments[0].scrollIntoView(true);", message)
+                time.sleep(0.5)
+
+                message_text = message.text
+                message_queue.put({'log': f"Extracted text: {message_text}"})
+
+                if "Tkickz" in message_text:
+                    ca = extract_ca_from_message(message_text)
+                    if ca:
+                        message_queue.put({'ca': ca, 'log': f"New CA found from Tkickz: {ca}"})
+                        handle_new_token(ca, message_queue)
+    except Exception as e:
+        message_queue.put({'log': f"Error in get_latest_messages: {str(e)}"})
+
+def open_discord_and_screenshot(message_queue):
+    global sniper_running, trading_driver
+    sniper_running = True
+    
+    open_trading_browser()
+    
+    discord_url = PRO_CHAT_CHANNEL
+    chrome_options = Options()
+    discord_profile_dir = os.path.join(base_user_data_dir, 'discord_profile')
+    os.makedirs(discord_profile_dir, exist_ok=True)
+    chrome_options.add_argument(f"user-data-dir={discord_profile_dir}")
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--window-size=1920,1080")
+    #chrome_options.add_argument("--headless=new")
+
+    driver = None
+    csv_file = None
+
+    try:
+        service = ChromeService(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+
+        csv_path = os.path.join(os.path.dirname(__file__), 'discord_content.csv')
+        csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['Timestamp', 'URL', 'Page Title', 'Message Text', 'Extracted CA'])
+
+        driver.get(discord_url)
+        WebDriverWait(driver, 30).until(lambda d: d.execute_script('return document.readyState') == 'complete')
+
+        message_queue.put({'log': f"Current URL after navigation: {driver.current_url}"})
+
+        try:
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "li[id^='chat-messages-']"))
+            )
+            message_queue.put({'log': "Channel loaded successfully"})
+        except Exception as e:
+            message_queue.put({'log': f"Error while waiting for channel to load: {str(e)}"})
+
+        last_ca = ''
+
+        while sniper_running:
+            message_queue.put({'log': "Entering main loop"})
+            current_url = driver.current_url
+            message_queue.put({'log': f"\nCurrent URL: {current_url}"})
+            message_queue.put({'log': f"Page title: {driver.title}"})
+
+            loop_start_time = time.time()
+
+            try:
+                get_latest_messages(driver, message_queue)
+            except Exception as e:
+                message_queue.put({'log': f"Failed to get latest messages: {str(e)}"})
+
+            loop_end_time = time.time()
+            loop_duration = loop_end_time - loop_start_time
+
+            message_queue.put({'log': f"Total loop time: {loop_duration:.2f}s"})
+
+            if loop_duration < 1:
+                time.sleep(1 - loop_duration)
+            elif loop_duration > 5:
+                message_queue.put({'log': "Warning: Processing is taking too long. Consider optimizing."})
+
+    except Exception as e:
+        message_queue.put({'log': f"An error occurred: {str(e)}"})
+        message_queue.put({'log': f"Traceback: {traceback.format_exc()}"})
+    finally:
+        if driver:
+            driver.quit()
+        if csv_file:
+            csv_file.close()
+        if trading_driver:
+            trading_driver.quit()
+        force_quit_chromedriver()
+
+def start_sniper(message_queue):
+    global sniper_running
+    sniper_running = True
+    threading.Thread(target=open_discord_and_screenshot, args=(message_queue,), daemon=True).start()
+
+def stop_sniper():
+    global sniper_running, trading_driver
+    sniper_running = False
+    if trading_driver:
+        trading_driver.quit()
+
+def main():
+    message_queue = queue.Queue()
+
+    try:
+        root = tk.Tk()
+        SniperApp(root,
+                        start_sniper_func=lambda: start_sniper(message_queue),
+                        stop_sniper_func=stop_sniper,
+                        message_queue=message_queue)
+
+        root.mainloop()
+    except Exception as e:
+        error_message = str(e)
+        print(f"An unexpected error occurred: {error_message}")
+        print(traceback.format_exc())
+        threading.Thread(target=send_message_to_contact, args=(error_message,)).start()
+    finally:
+        stop_sniper()
+
+if __name__ == "__main__":
+    main()
+
+        --------------------------------------------------
